@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Import Libraries
 import argparse
 import json
@@ -9,11 +8,20 @@ from pyspark import StorageLevel
 from pyspark.sql import SparkSession, Window, functions as F
 
 
+# Baseline settings, fixed rather than exposed as flags.
+SEED = 42
+K_VALUES = [10, 50, 100]
+TRAIN_SAMPLE_SIZE = 50000 # sample mode only, --full-data uses everything
+VALIDATION_SAMPLE_SIZE = 5000
+MIN_PAIR_SUPPORT = 3 # a co-occurrence pair needs this many playlists behind it
+MIN_CANDIDATE_POPULARITY = 5
+
+
 # Create the Spark session that does the heavy dataframe work for this script.
-def create_spark_session(app_name, master, driver_memory):
+def create_spark_session(driver_memory):
     return (
-        SparkSession.builder.appName(app_name) # name of Spark app (spotify-mpd-ingestion)
-        .master(master) # where the Spark Session will run (local)
+        SparkSession.builder.appName("spotify-mpd-baselines") # name of Spark app (spotify-mpd-ingestion)
+        .master("local[*]") # where the Spark Session will run (local)
         .config("spark.driver.memory", driver_memory) # amount of RAM to give process (4 - 8GB)
         .config("spark.sql.shuffle.partitions", "64") # when dealing with groupBy, joins, aggregations, we split into 64 partitions instead of the default 200 (easier on local device)
         .config("spark.sql.session.timeZone", "UTC") # sets timezone to UTC
@@ -28,36 +36,11 @@ def read_gold_tables(input_dir, spark):
     validation_context_path = input_root / "validation_context.parquet"
     validation_targets_path = input_root / "validation_targets.parquet"
 
-    if not train_path.exists():
-        raise FileNotFoundError(f"Missing train table: {train_path}")
-    if not validation_context_path.exists():
-        raise FileNotFoundError(f"Missing validation context table: {validation_context_path}")
-    if not validation_targets_path.exists():
-        raise FileNotFoundError(f"Missing validation target table: {validation_targets_path}")
 
     train_df = spark.read.parquet(str(train_path))
     validation_context_df = spark.read.parquet(str(validation_context_path))
     validation_targets_df = spark.read.parquet(str(validation_targets_path))
     return train_df, validation_context_df, validation_targets_df
-
-
-# Turns a comma-separated string like "10,50,100" into a clean sorted list of K values.
-# main() uses this once so every recommendation and metric function shares the same cutoffs.
-def parse_k_values(k_values_text):
-    k_values = []
-    for value in k_values_text.split(","):
-        stripped = value.strip()
-        if not stripped:
-            continue
-        parsed = int(stripped)
-        if parsed <= 0:
-            raise ValueError(f"K values must be positive integers, got: {parsed}")
-        k_values.append(parsed)
-
-    if not k_values:
-        raise ValueError("At least one K value is required.")
-
-    return sorted(set(k_values))
 
 
 # Deterministically samples pid values by hashing pid and taking the lowest hash scores.
@@ -320,19 +303,11 @@ def write_metrics_json(metrics_by_baseline, metrics_path):
 # main() calls this first so both execution modes share one interface.
 def parse_args():
     parser = argparse.ArgumentParser(description="Run popularity and co-occurrence baselines on the gold Parquet tables.")
-    parser.add_argument("--input", required=True, help="Directory containing the gold Parquet tables.")
-    parser.add_argument("--output", required=True, help="Directory where baseline artifacts will be written.")
-    parser.add_argument("--master", default="local[*]", help="Spark master URL. Default: local[*].")
-    parser.add_argument("--app-name", default="spotify-mpd-baselines", help="Spark application name.")
-    parser.add_argument("--driver-memory", default="8g", help="Spark driver memory. Example: 8g or 16g.")
-    parser.add_argument("--full-data", action="store_true", help="Disable local sampling and use the full gold tables.")
-    parser.add_argument("--seed", type=int, default=42, help="Seed used for deterministic sampling.")
-    parser.add_argument("--train-sample-size", type=int, default=50000, help="Train playlists to use in sample mode.")
-    parser.add_argument("--validation-sample-size", type=int, default=5000, help="Validation playlists to use in sample mode.")
-    parser.add_argument("--k-values", default="10,50,100", help="Comma-separated K values. Default: 10,50,100.")
-    parser.add_argument("--min-pair-support", type=int, default=3, help="Minimum co-occurrence pair support.")
-    parser.add_argument("--min-candidate-popularity", type=int, default=5, help="Minimum train popularity for candidate tracks.")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing baseline artifacts.")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--driver-memory", default="8g")
+    parser.add_argument("--full-data", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -340,8 +315,7 @@ def parse_args():
 # This is the one place where the local sample workflow and later Azure full-data workflow stay identical.
 def main():
     args = parse_args()
-    k_values = parse_k_values(args.k_values) # turns string of k values into list
-    max_k = max(k_values) # identifies the max k value
+    max_k = max(K_VALUES)
     
     output_root = Path(args.output) # creates a Path object to data/silver where the Parquet tables will be stored
     output_root.mkdir(parents=True, exist_ok=True) # creates the output directory data/silver if it doesn't exist already
@@ -354,7 +328,7 @@ def main():
     write_mode = "overwrite" if args.overwrite else "errorifexists" # if we use --overwrite in CLI, then MPD file ingestion overwrites all old files in data/silver/{path}
 
     # Creates SparkSession
-    spark = create_spark_session(args.app_name, args.master, args.driver_memory)
+    spark = create_spark_session(args.driver_memory)
 
     try:
         train_df, validation_context_df, validation_targets_df = read_gold_tables(args.input, spark)
@@ -362,9 +336,7 @@ def main():
             train_df,
             validation_context_df,
             validation_targets_df,
-            args.seed,
-            args.train_sample_size, # 50,000 playlists for train
-            args.validation_sample_size, # 5,000 playlists for validation
+            SEED, TRAIN_SAMPLE_SIZE, VALIDATION_SAMPLE_SIZE,
             args.full_data, # defaults to False, unless add --full_data in CLI script run
         )
         # .persist(StorageLevel.MEMORY_AND_DISK) -> persist/cache the DataFrame so it doesn't recompute it on every run, use memory first and spill into disk if need be.
@@ -377,8 +349,7 @@ def main():
         cooccurrence_pairs_df = build_cooccurrence_pairs(
             run_train_df,
             track_popularity_df,
-            args.min_pair_support, # minimum 3 co-occurrence pairs
-            args.min_candidate_popularity, # minimum the track shows up 5 times
+            MIN_PAIR_SUPPORT, MIN_CANDIDATE_POPULARITY,
         ).persist(StorageLevel.MEMORY_AND_DISK)
         cooccurrence_recommendations_df = build_cooccurrence_recommendations(
             run_validation_context_df, 
@@ -386,7 +357,7 @@ def main():
             max_k,
         )
         recommendations_df = popularity_recommendations_df.unionByName(cooccurrence_recommendations_df).persist(StorageLevel.MEMORY_AND_DISK)
-        metrics_by_baseline = compute_metrics(spark, recommendations_df, run_validation_targets_df, k_values)
+        metrics_by_baseline = compute_metrics(spark, recommendations_df, run_validation_targets_df, K_VALUES)
         
         # Writes train/val/test tables to parquet in artifacts/baselines/sample
         track_popularity_df.write.mode(write_mode).parquet(str(popularity_path))
@@ -402,7 +373,7 @@ def main():
             "full_data_mode": bool(args.full_data),
             "input_path": str(Path(args.input)),
             "output_path": str(output_root),
-            "k_values": k_values,
+            "k_values": K_VALUES,
             "sampled_train_playlists": sampled_train_playlists,
             "sampled_validation_playlists": sampled_validation_playlists,
             "track_popularity_path": str(popularity_path),

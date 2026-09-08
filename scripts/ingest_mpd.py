@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Import Libraries
 import argparse
 import json
@@ -9,10 +8,10 @@ from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import ArrayType, BooleanType, LongType, StringType, StructField, StructType
 
 # Create the Spark session that does the heavy dataframe work for this script.
-def create_spark_session(app_name, master, driver_memory):
+def create_spark_session(driver_memory):
     return (
-        SparkSession.builder.appName(app_name) # name of Spark app (spotify-mpd-ingestion)
-        .master(master) # where the Spark Session will run (local)
+        SparkSession.builder.appName("spotify-mpd-ingestion") # name of Spark app (spotify-mpd-ingestion)
+        .master("local[*]") # where the Spark Session will run (local)
         .config("spark.driver.memory", driver_memory) # amount of RAM to give process (4 - 8GB)
         .config("spark.sql.shuffle.partitions", "64") # when dealing with groupBy, joins, aggregations, we split into 64 partitions instead of the default 200 (easier on local device)
         .config("spark.sql.session.timeZone", "UTC") # sets timezone to UTC
@@ -64,16 +63,11 @@ MPD_SCHEMA = StructType(
 # Finds all JSON files that match the MPD file pattern set above in an input directory
 def find_mpd_files(input_dir):
     input_path = Path(input_dir) # creates a Path object to input_dir
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input directory does not exist: {input_path}")
 
     mpd_files = []
     for path in sorted(input_path.rglob("*.json")): # recursively checks all files in input_dir, sort for consistency
         if MPD_FILE_PATTERN.search(path.name): # if the file name matches the MPD file pattern set above
             mpd_files.append(str(path.resolve())) # appends the full input_path + path.name
-
-    if not mpd_files:
-        raise FileNotFoundError(f"No MPD JSON files found under: {input_path}")
 
     return mpd_files
 
@@ -178,12 +172,10 @@ def build_playlist_tracks(playlist_rows):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Ingest Spotify MPD JSON into three Parquet tables.")
-    parser.add_argument("--input", required=True, help="Directory containing the MPD JSON files.")
-    parser.add_argument("--output", required=True, help="Directory where Parquet tables will be written.")
-    parser.add_argument("--master", default="local[*]", help="Spark master URL. Default: local[*].")
-    parser.add_argument("--app-name", default="spotify-mpd-ingestion", help="Spark application name.")
-    parser.add_argument("--driver-memory", default="4g", help="Spark driver memory. Example: 4g or 8g.")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing Parquet outputs.")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--driver-memory", default="4g")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -202,7 +194,7 @@ def main():
     write_mode = "overwrite" if args.overwrite else "errorifexists" # if we use --overwrite in CLI, then MPD file ingestion overwrites all old files in data/silver/{path}
 
     # Creates SparkSession
-    spark = create_spark_session(args.app_name, args.master, args.driver_memory) # Creates SparkSession with given a name, where to run it, and RAM to allocate it
+    spark = create_spark_session(args.driver_memory) # Creates SparkSession with given a name, where to run it, and RAM to allocate it
 
     try:
         # uses our SparkSession to read a the input_files JSON into the MPD_SCHEMA schema. 

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Import Libraries
 import argparse
 import json
@@ -6,11 +5,20 @@ from pathlib import Path
 
 from pyspark.sql import SparkSession, Window, functions as F
 
+# The split design, fixed once and never changed from the command line.
+SEED = 42
+TRAIN_RATIO = 0.90
+VALIDATION_RATIO = 0.05
+MIN_PLAYLIST_LENGTH = 5 # shorter playlists can't spare tracks for evaluation
+MASK_FRACTION = 0.20 # hide 20% of each eval playlist
+MAX_HIDDEN = 10
+
+
 # Create the Spark session that does the heavy dataframe work for this script.
-def create_spark_session(app_name, master, driver_memory):
+def create_spark_session(driver_memory):
     return (
-        SparkSession.builder.appName(app_name) # name of Spark app (spotify-mpd-ingestion)
-        .master(master) # where the Spark Session will run (local)
+        SparkSession.builder.appName("spotify-mpd-splits") # name of Spark app (spotify-mpd-ingestion)
+        .master("local[*]") # where the Spark Session will run (local)
         .config("spark.driver.memory", driver_memory) # amount of RAM to give process (4 - 8GB)
         .config("spark.sql.shuffle.partitions", "64") # when dealing with groupBy, joins, aggregations, we split into 64 partitions instead of the default 200 (easier on local device)
         .config("spark.sql.session.timeZone", "UTC") # sets timezone to UTC
@@ -24,10 +32,6 @@ def read_silver_tables(input_dir, spark):
     playlists_path = input_root / "playlists.parquet"
     playlist_tracks_path = input_root / "playlist_tracks.parquet"
 
-    if not playlists_path.exists():
-        raise FileNotFoundError(f"Missing playlists table: {playlists_path}")
-    if not playlist_tracks_path.exists():
-        raise FileNotFoundError(f"Missing playlist_tracks table: {playlist_tracks_path}")
 
     playlists_df = spark.read.parquet(str(playlists_path))
     playlist_tracks_df = spark.read.parquet(str(playlist_tracks_path))
@@ -147,28 +151,12 @@ def build_masked_split(playlist_tracks_df, playlist_splits_df, split_name, seed,
     return context_df, targets_df
 
 
-# Checks that the split ratios add up to 1.0
-def validate_ratios(train_ratio, validation_ratio, test_ratio):
-    total_ratio = train_ratio + validation_ratio + test_ratio
-    if abs(total_ratio - 1.0) > 1e-9:
-        raise ValueError(f"Split ratios must add up to 1.0, got {total_ratio}")
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Build train, validation, and test splits from silver Parquet tables.")
-    parser.add_argument("--input", required=True, help="Directory containing the silver Parquet tables.")
-    parser.add_argument("--output", required=True, help="Directory where the gold split tables will be written.")
-    parser.add_argument("--master", default="local[*]", help="Spark master URL. Default: local[*].")
-    parser.add_argument("--app-name", default="spotify-mpd-splits", help="Spark application name.")
-    parser.add_argument("--driver-memory", default="4g", help="Spark driver memory. Example: 4g or 8g.")
-    parser.add_argument("--train-ratio", type=float, default=0.90, help="Train split ratio. Default: 0.90.")
-    parser.add_argument("--validation-ratio", type=float, default=0.05, help="Validation split ratio. Default: 0.05.")
-    parser.add_argument("--test-ratio", type=float, default=0.05, help="Test split ratio. Default: 0.05.")
-    parser.add_argument("--seed", type=int, default=42, help="Seed used for deterministic split and mask hashing.")
-    parser.add_argument("--min-playlist-length", type=int, default=5, help="Minimum playlist length for masked evaluation.")
-    parser.add_argument("--mask-fraction", type=float, default=0.20, help="Fraction of each eval playlist to hide.")
-    parser.add_argument("--max-hidden", type=int, default=10, help="Maximum number of hidden songs per eval playlist.")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing Parquet outputs.")
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--driver-memory", default="4g")
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -176,7 +164,6 @@ def parse_args():
 # Reads in data/silver tables, makes train/val/test split, build masked context/target DataFrames, writes final parquet tables to data/gold
 def main():
     args = parse_args()
-    validate_ratios(args.train_ratio, args.validation_ratio, args.test_ratio) # Ensures that the ratios add up to 1
 
     output_root = Path(args.output) # creates a Path object to data/silver where the Parquet tables will be stored
     output_root.mkdir(parents=True, exist_ok=True) # creates the output directory data/silver if it doesn't exist already
@@ -191,37 +178,23 @@ def main():
     write_mode = "overwrite" if args.overwrite else "errorifexists" # if we use --overwrite in CLI, then MPD file ingestion overwrites all old files in data/silver/{path}
 
     # Creates SparkSession
-    spark = create_spark_session(args.app_name, args.master, args.driver_memory)
+    spark = create_spark_session(args.driver_memory)
 
     try:
         playlists_df, playlist_tracks_df = read_silver_tables(args.input, spark) # Reads parquet tables from data/silver into Spark DataFrames
         playlist_lengths_df = build_playlist_lengths(playlists_df, playlist_tracks_df) # Builds a DataFrame with pid, and accurate playlist length
         playlist_splits_df = assign_playlist_splits( # Builds DataFrame with pid, split, playlist length, eligible for eval
-            playlist_lengths_df,
-            args.train_ratio, # .90
-            args.validation_ratio, # .05
-            args.min_playlist_length, # 5 songs
-            args.seed,
+            playlist_lengths_df, TRAIN_RATIO, VALIDATION_RATIO, MIN_PLAYLIST_LENGTH, SEED,
         )
 
         train_playlist_tracks_df = build_train_tracks(playlist_tracks_df, playlist_splits_df)
         # Builds our validation masked DataFrames with default settings from args
         validation_context_df, validation_targets_df = build_masked_split(
-            playlist_tracks_df,
-            playlist_splits_df,
-            "validation",
-            args.seed,
-            args.mask_fraction, # .20
-            args.max_hidden, # 10 songs
+            playlist_tracks_df, playlist_splits_df, "validation", SEED, MASK_FRACTION, MAX_HIDDEN,
         )
         # Builds our test masked DataFrames with default settings from args
         test_context_df, test_targets_df = build_masked_split(
-            playlist_tracks_df,
-            playlist_splits_df,
-            "test",
-            args.seed,
-            args.mask_fraction, # .20
-            args.max_hidden, # 10 songs
+            playlist_tracks_df, playlist_splits_df, "test", SEED, MASK_FRACTION, MAX_HIDDEN,
         )
 
         # Writes train/val/test tables to parquet in data/gold

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # Import Libraries
 import argparse
 import json
@@ -7,38 +6,10 @@ from pathlib import Path
 
 from pyspark.sql import SparkSession, functions as F
 
-# build_vocab.py lives in scripts/, and the finished Vocabulary class lives in
-# scripts/twotower/vocab.py. When this file is run directly, Python puts its own
-# directory (scripts/) on sys.path[0], so `from twotower.vocab import Vocabulary`
-# resolves. We insert it explicitly as well so the import also works when this
-# module is imported from elsewhere (e.g. a REPL launched from the repo root).
-SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent)) # so "twotower" resolves when run as a script
 from twotower.vocab import Vocabulary  # noqa: E402  (import after sys.path setup)
 
 
-# The three ID columns we build vocabularies for. Order here is the order used
-# for the printed summary table and the metadata file.
-ENTITY_COLUMNS = ("track_id", "artist_id", "album_id")
-
-# Short name -> column, used as the key inside vocab_metadata.json and the
-# stem of each saved vocab file (track_vocab.json, etc.).
-ENTITY_NAMES = {
-    "track_id": "track",
-    "artist_id": "artist",
-    "album_id": "album",
-}
-
-# Known distinct counts on the FULL train split. Printed next to the actual
-# counts as a sanity check. These are only meaningful when the input is the full
-# train_playlist_tracks table with --min-*-freq 1; on a sample they will differ,
-# so a mismatch is informational, not an error.
-EXPECTED_DISTINCT = {
-    "track": 2149613,
-    "artist": 283482,
-    "album": 705025,
-}
 
 # Embedding dimensions we report parameter counts and GPU memory for. The
 # two-tower model shares one embedding table per entity across both towers, so
@@ -53,10 +24,10 @@ BYTES_PER_PARAM = 16
 
 # Create the Spark session that does the heavy dataframe work for this script.
 # Mirrors the config used in ingest_mpd.py and build_splits.py.
-def create_spark_session(app_name, master, driver_memory):
+def create_spark_session(driver_memory):
     return (
-        SparkSession.builder.appName(app_name)  # name of Spark app (spotify-mpd-vocab)
-        .master(master)  # where the Spark Session will run (local)
+        SparkSession.builder.appName("spotify-mpd-vocab")  # name of Spark app (spotify-mpd-vocab)
+        .master("local[*]")  # where the Spark Session will run (local)
         .config("spark.driver.memory", driver_memory)  # amount of RAM to give process (4 - 8GB)
         .config("spark.sql.shuffle.partitions", "64")  # split groupBy/agg into 64 partitions instead of the default 200
         .config("spark.sql.session.timeZone", "UTC")  # sets timezone to UTC
@@ -131,66 +102,21 @@ def compute_embedding_budget(vocab_sizes):
     return budget
 
 
-# Pretty-print the per-entity counts and the memory budget to stdout.
-def print_summary(entity_stats, embedding_budget):
-    print()
-    print("Vocabulary summary")
-    print("=" * 78)
-    header = f"{'entity':<8} {'raw distinct':>14} {'after cutoff':>14} {'vocab size':>12} {'min freq':>9}"
-    print(header)
-    print("-" * 78)
-    for name, stats in entity_stats.items():
-        print(
-            f"{name:<8} {stats['raw_distinct']:>14,} {stats['kept_after_cutoff']:>14,} "
-            f"{stats['vocab_size']:>12,} {stats['min_freq']:>9}"
-        )
-    print("-" * 78)
-
-    # Sanity-check line: actual raw distinct vs. the known full-split counts.
-    print("Sanity check vs. known full-split distinct counts:")
-    for name, stats in entity_stats.items():
-        expected = EXPECTED_DISTINCT[name]
-        match = "OK" if stats["raw_distinct"] == expected else "DIFF"
-        print(f"  {name:<8} actual={stats['raw_distinct']:>12,}  expected={expected:>12,}  [{match}]")
-    print("-" * 78)
-
-    # Embedding parameter / memory budget.
-    total_rows = embedding_budget["total_embedding_rows"]
-    print(f"Shared embedding rows (track + artist + album): {total_rows:,}")
-    for dim in REPORT_DIMS:
-        info = embedding_budget[f"dim_{dim}"]
-        print(
-            f"  dim {dim:<4} -> {info['params']:>15,} params, "
-            f"~{info['memory_gb']:.3f} GB (params + Adam state @ {BYTES_PER_PARAM} B/param)"
-        )
-    print("=" * 78)
-    print()
-
-
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Build track/artist/album vocabularies from the gold train split for the two-tower model."
     )
-    parser.add_argument(
-        "--input",
-        default="data/gold/train_playlist_tracks.parquet",
-        help="Path to the gold train_playlist_tracks Parquet table. NEVER pass val/test (label leakage).",
-    )
-    parser.add_argument(
-        "--output",
-        default="artifacts/vocab",
-        help="Directory where the vocab JSON files and metadata will be written.",
-    )
-    parser.add_argument("--master", default="local[*]", help="Spark master URL. Default: local[*].")
-    parser.add_argument("--app-name", default="spotify-mpd-vocab", help="Spark application name.")
-    parser.add_argument("--driver-memory", default="4g", help="Spark driver memory. Example: 4g or 8g.")
+    # --input must be the gold TRAIN table, val/test would leak labels into the vocab.
+    parser.add_argument("--input", default="data/gold/train_playlist_tracks.parquet")
+    parser.add_argument("--output", default="artifacts/vocab")
+    parser.add_argument("--driver-memory", default="4g")
     # Frequency cutoffs: IDs appearing fewer than N times in train are excluded
     # from the vocab and encode to the unknown index at runtime. Default 1 keeps
     # everything.
-    parser.add_argument("--min-track-freq", type=int, default=1, help="Drop tracks appearing fewer than N times in train.")
-    parser.add_argument("--min-artist-freq", type=int, default=1, help="Drop artists appearing fewer than N times in train.")
-    parser.add_argument("--min-album-freq", type=int, default=1, help="Drop albums appearing fewer than N times in train.")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing vocab outputs.")
+    parser.add_argument("--min-track-freq", type=int, default=1)
+    parser.add_argument("--min-artist-freq", type=int, default=1)
+    parser.add_argument("--min-album-freq", type=int, default=1)
+    parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
@@ -202,11 +128,6 @@ def main():
 
     # Fail loudly if the input path is missing.
     input_path = Path(args.input)
-    if not input_path.exists():
-        raise FileNotFoundError(
-            f"Input train table does not exist: {input_path}. "
-            "Expected the gold train_playlist_tracks.parquet produced by build_splits.py."
-        )
 
     # Map each entity's min-freq flag once so the loop below stays simple.
     min_freqs = {
@@ -230,7 +151,7 @@ def main():
 
     output_root.mkdir(parents=True, exist_ok=True)
 
-    spark = create_spark_session(args.app_name, args.master, args.driver_memory)
+    spark = create_spark_session(args.driver_memory)
 
     try:
         train_df = spark.read.parquet(str(input_path))
@@ -268,16 +189,10 @@ def main():
         }
         metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
 
-        print_summary(entity_stats, embedding_budget)
-
-        # Machine-readable summary to stdout, matching the other scripts.
         summary = {
-            "input_path": str(input_path),
             "output_path": str(output_root),
-            "track_vocab_path": str(vocab_paths["track"]),
-            "artist_vocab_path": str(vocab_paths["artist"]),
-            "album_vocab_path": str(vocab_paths["album"]),
-            "metadata_path": str(metadata_path),
+            "vocab_sizes": vocab_sizes,
+            "embedding_rows": embedding_budget["total_embedding_rows"],
         }
         print(json.dumps(summary, indent=2, sort_keys=True))
     finally:
