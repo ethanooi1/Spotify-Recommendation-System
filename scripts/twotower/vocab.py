@@ -2,46 +2,41 @@
 import json
 from pathlib import Path
 
-
-# Maps track/artist/album string IDs to contiguous integers, which become embedding table rows.
-# Index 0 is PAD, the empty slot short playlists get padded with and masked out during pooling.
-# Index 1 is UNK, where any ID we didn't see in training lands. Real IDs start at 2.
+# Maps track/artist/album string IDs to contiguous integers which become embedding table rows.
+# Index 0 is PAD, an empty row for each entity's embedding table to pad short playlists to the same length as the longest playlist in the batch
+# Index 1 is UNK, a row for each entity's embedding table to hold any ID we didn't see in training. UNK will learn its own embedding vector, but it will be shared by all unseen IDs. Real IDs start at 2.
 class Vocabulary:
     PAD_INDEX = 0
     UNK_INDEX = 1
     NUM_RESERVED = 2
 
-    def __init__(self, id_to_index, index_to_id):
+    def __init__(self, id_to_index):
         self.id_to_index = id_to_index
-        self.index_to_id = index_to_id
 
+    # sorted so the same IDs always get the same indices
     @classmethod
     def build(cls, ids):
-        id_to_index, index_to_id = {}, {}
-        for idx, string_id in enumerate(sorted(set(ids))):
-            index = idx + cls.NUM_RESERVED
-            id_to_index[string_id] = index
-            index_to_id[index] = string_id
-        return cls(id_to_index, index_to_id)
+        id_to_index = {}
+        for i, string_id in enumerate(sorted(set(ids))):
+            id_to_index[string_id] = i + cls.NUM_RESERVED
 
-    def encode(self, string_id):
-        return self.id_to_index.get(string_id, self.UNK_INDEX)
+        return cls(id_to_index)
 
+    # Anything the vocab hasn't seen falls back to UNK and shares its embedding with all other unseen IDs
     def encode_batch(self, string_ids):
-        return [self.id_to_index.get(sid, self.UNK_INDEX) for sid in string_ids]
+        indices = []
+        for string_id in string_ids:
+            indices.append(self.id_to_index.get(string_id, self.UNK_INDEX))
 
-    def decode(self, index):
-        return self.index_to_id.get(index, None)
+        return indices
 
     @property
     def size(self):
         return len(self.id_to_index) + self.NUM_RESERVED
 
     def save(self, path):
-        Path(path).write_text(json.dumps({"id_to_index": self.id_to_index}, indent=2))
+        Path(path).write_text(json.dumps({'id_to_index': self.id_to_index}, indent=2))
 
     @classmethod
     def load(cls, path):
-        id_to_index = json.loads(Path(path).read_text())["id_to_index"]
-        index_to_id = {int(idx): sid for sid, idx in id_to_index.items()} # JSON keys come back as strings
-        return cls(id_to_index, index_to_id)
+        return cls(json.loads(Path(path).read_text())['id_to_index'])
