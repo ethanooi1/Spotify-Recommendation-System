@@ -1,5 +1,4 @@
 # Import Libraries
-import argparse
 import json
 import math
 from pathlib import Path
@@ -7,385 +6,297 @@ from pathlib import Path
 from pyspark import StorageLevel
 from pyspark.sql import SparkSession, Window, functions as F
 
+from build_splits import MAX_HIDDEN
 
-# Baseline settings, fixed rather than exposed as flags.
+INPUT_DIR = 'data/gold'
+OUTPUT_DIR = 'artifacts/baselines'
+
 SEED = 42
 K_VALUES = [10, 50, 100]
-TRAIN_SAMPLE_SIZE = 50000 # sample mode only, --full-data uses everything
-VALIDATION_SAMPLE_SIZE = 5000
-MIN_PAIR_SUPPORT = 3 # a co-occurrence pair needs this many playlists behind it
+SPLITS = ['validation', 'test']
+BASELINES = ['popularity', 'cooccurrence']
+MIN_PAIR_SUPPORT = 3
 MIN_CANDIDATE_POPULARITY = 5
+COOCCURRENCE_SAMPLE_SIZE = 50000 # Cooccurrence sample size is capped for memory reasons, would need 6.5B pairs which is too much to compute
+MAX_PAIRS_PER_TRACK = 200 # capped for memory reasons
 
-
-# Create the Spark session that does the heavy dataframe work for this script.
-def create_spark_session(driver_memory):
-    return (
-        SparkSession.builder.appName("spotify-mpd-baselines") # name of Spark app (spotify-mpd-ingestion)
-        .master("local[*]") # where the Spark Session will run (local)
-        .config("spark.driver.memory", driver_memory) # amount of RAM to give process (4 - 8GB)
-        .config("spark.sql.shuffle.partitions", "64") # when dealing with groupBy, joins, aggregations, we split into 64 partitions instead of the default 200 (easier on local device)
-        .config("spark.sql.session.timeZone", "UTC") # sets timezone to UTC
-        .getOrCreate() # if SparkSession already exists, return it, otherwise create a new one
+def create_spark_session():
+    spark = (
+        SparkSession.builder.appName('spotify-mpd-baselines')
+        .master('local[8]')
+        .config('spark.driver.bindAddress', '127.0.0.1')
+        .config('spark.driver.memory', '12g')
+        .config('spark.sql.shuffle.partitions', '800')
+        .config('spark.sql.session.timeZone', 'UTC')
+        .getOrCreate()
     )
+    spark.sparkContext.setLogLevel('ERROR')
+    
+    return spark
 
+# Training data, val for context+target, and test for context+target
+def read_gold_tables(spark):
+    input_root = Path(INPUT_DIR)
+    train_df = spark.read.parquet(str(input_root / 'train_playlist_tracks.parquet'))
 
-# Reads parquet tables from data/gold
-def read_gold_tables(input_dir, spark):
-    input_root = Path(input_dir)
-    train_path = input_root / "train_playlist_tracks.parquet"
-    validation_context_path = input_root / "validation_context.parquet"
-    validation_targets_path = input_root / "validation_targets.parquet"
+    eval_tables = {}
+    for split in SPLITS:
+        context_df = spark.read.parquet(str(input_root / f'{split}_context.parquet'))
+        targets_df = spark.read.parquet(str(input_root / f'{split}_targets.parquet'))
+        eval_tables[split] = (context_df, targets_df)
 
+    return train_df, eval_tables
 
-    train_df = spark.read.parquet(str(train_path))
-    validation_context_df = spark.read.parquet(str(validation_context_path))
-    validation_targets_df = spark.read.parquet(str(validation_targets_path))
-    return train_df, validation_context_df, validation_targets_df
-
-
-# Deterministically samples pid values by hashing pid and taking the lowest hash scores.
-# main() uses this for sample mode so local reruns always pick the same playlists.
-def select_sample_pids(pid_df, split_name, seed, sample_size, full_data):
-    distinct_pids = pid_df.select("pid").distinct()
-
-    if full_data:
-        return distinct_pids
-
-    return (
-        distinct_pids
-        .withColumn(
-            "sample_score",
+# Samples playlists determinisitcally using hash splitting for cooccurrence split
+def select_sample_pids(train_df, sample_size):
+    return (train_df
+        .select('pid').distinct()
+        .withColumn('sample_score',
             F.pmod(
-                F.xxhash64(
-                    F.lit(str(seed)),
-                    F.lit(split_name),
-                    F.col("pid").cast("string"),
-                ),
-                F.lit(1000000),
-            ),
-        )
-        .orderBy(F.col("sample_score"), F.col("pid"))
+                F.xxhash64(F.lit(str(SEED)),F.lit('train'),F.col('pid').cast('string')), 
+                F.lit(1000000)))
+        .orderBy(F.col('sample_score'), F.col('pid'))
         .limit(sample_size)
-        .select("pid")
+        .select('pid')
     )
 
-
-# Filters the train and validation tables down to either the sampled playlists or the full data.
-# main() uses this once so every later baseline runs on the exact same sampled or full subset.
-def build_run_tables(train_df, validation_context_df, validation_targets_df, seed, train_sample_size, validation_sample_size, full_data):
-    sampled_train_pids = select_sample_pids(train_df.select("pid"), "train", seed, train_sample_size, full_data)
-    sampled_validation_pids = select_sample_pids(validation_context_df.select("pid"), "validation", seed, validation_sample_size, full_data)
-
-    sampled_train_df = (
-        train_df.join(sampled_train_pids, on="pid", how="inner")
-        .where(F.col("track_id").isNotNull())
-        .select("pid", "pos", "track_id", "artist_id", "album_id", "duration_ms")
-    )
-    sampled_validation_context_df = (
-        validation_context_df.join(sampled_validation_pids, on="pid", how="inner")
-        .where(F.col("track_id").isNotNull())
-        .select("pid", "pos", "track_id", "artist_id", "album_id", "duration_ms")
-    )
-    sampled_validation_targets_df = (
-        validation_targets_df.join(sampled_validation_pids, on="pid", how="inner")
-        .where(F.col("track_id").isNotNull())
-        .select("pid", "pos", "track_id", "artist_id", "album_id", "duration_ms")
-    )
-
-    return sampled_train_df, sampled_validation_context_df, sampled_validation_targets_df
-
-
-# Counts how popular each track is in the train split and ranks tracks from most common to least common.
-# main() builds this once because both baselines use global train popularity in different ways.
+# Frequency of tracks in the train split ranked desc
 def build_track_popularity(train_df):
-    popularity_window = Window.orderBy(F.desc("train_frequency"), F.asc("track_id"))
+    popularity_window = Window.orderBy(F.desc('train_frequency'), F.asc('track_id'))
 
-    return (
-        train_df.groupBy("track_id")
-        .agg(F.count(F.lit(1)).cast("long").alias("train_frequency"))
-        .withColumn("popularity_rank", F.row_number().over(popularity_window))
-        .select("track_id", "train_frequency", "popularity_rank")
+    return (train_df
+        .groupBy('track_id')
+        .agg(F.count(F.lit(1)).cast('long').alias('train_frequency'))
+        .withColumn('popularity_rank', F.row_number().over(popularity_window))
+        .select('track_id', 'train_frequency', 'popularity_rank')
     )
 
-
-# Builds the popularity baseline by recommending the globally most common tracks not already in each playlist.
-# main() uses this to create the easiest benchmark before the stronger co-occurrence baseline.
-def build_popularity_recommendations(validation_context_df, track_popularity_df, max_k):
-    playlists_df = validation_context_df.select("pid").distinct()
-    context_tracks_df = validation_context_df.select("pid", "track_id").distinct()
-    max_unique_context_tracks = (
-        context_tracks_df.groupBy("pid")
-        .agg(F.count(F.lit(1)).alias("unique_context_tracks"))
-        .agg(F.max("unique_context_tracks").alias("max_unique_context_tracks"))
-        .first()["max_unique_context_tracks"]
+# Popularity Baseline: recommend the most frequent tracks a playlist doesn't already have
+def build_popularity_recommendations(context_df, track_popularity_df, max_k):
+    playlists_df = context_df.select('pid').distinct()
+    context_tracks_df = context_df.select('pid', 'track_id').distinct()
+    max_unique_context_tracks = (context_tracks_df
+        .groupBy('pid')
+        .agg(F.count(F.lit(1)).alias('unique_context_tracks'))
+        .agg(F.max('unique_context_tracks').alias('max_unique_context_tracks'))
+        .first()['max_unique_context_tracks']
     )
     max_unique_context_tracks = 0 if max_unique_context_tracks is None else int(max_unique_context_tracks)
 
-    candidate_pool_size = max_k + max_unique_context_tracks + 50
-    candidate_pool_df = (
-        track_popularity_df.orderBy(F.asc("popularity_rank"))
-        .limit(candidate_pool_size)
-        .select("track_id", "train_frequency", "popularity_rank")
+    candidate_pool_df = (track_popularity_df
+        .orderBy(F.asc('popularity_rank'))
+        .limit(max_k + max_unique_context_tracks + 50)
+        .select('track_id', 'train_frequency', 'popularity_rank')
     )
 
-    popularity_rank_window = Window.partitionBy("pid").orderBy(
-        F.desc("train_frequency"),
-        F.asc("popularity_rank"),
-        F.asc("track_id"),
+    popularity_rank_window = (Window
+        .partitionBy('pid')
+        .orderBy(F.desc('train_frequency'), F.asc('popularity_rank'), F.asc('track_id'))
     )
 
-    return (
-        playlists_df.crossJoin(F.broadcast(candidate_pool_df))
-        .join(context_tracks_df, on=["pid", "track_id"], how="left_anti")
-        .withColumn("rank", F.row_number().over(popularity_rank_window))
-        .where(F.col("rank") <= F.lit(max_k))
-        .withColumn("baseline_name", F.lit("popularity"))
-        .withColumn("score", F.col("train_frequency").cast("double"))
-        .select("baseline_name", "pid", "rank", "track_id", "score")
+    return (playlists_df
+        .crossJoin(F.broadcast(candidate_pool_df))
+        .join(context_tracks_df, on=['pid', 'track_id'], how='left_anti')
+        .withColumn('rank', F.row_number().over(popularity_rank_window))
+        .where(F.col('rank') <= F.lit(max_k))
+        .withColumn('baseline_name', F.lit('popularity'))
+        .withColumn('score', F.col('train_frequency').cast('double'))
+        .select('baseline_name', 'pid', 'rank', 'track_id', 'score')
     )
 
-
-# Builds exact track-to-track co-occurrence counts from the train playlists.
-# main() uses this as the stronger simple baseline that later PyTorch models should beat.
-def build_cooccurrence_pairs(train_df, track_popularity_df, min_pair_support, min_candidate_popularity):
-    train_source_df = train_df.select("pid", "track_id").where(F.col("track_id").isNotNull())
-    recommendable_tracks_df = (
-        track_popularity_df.where(F.col("train_frequency") >= F.lit(min_candidate_popularity))
+# Builds track-track pairs across sampled train playlists. Capped at 200 pairs per context track
+def build_cooccurrence_pairs(train_df, track_popularity_df):
+    train_source_df = train_df.select('pid', 'track_id').where(F.col('track_id').isNotNull())
+    recommendable_tracks_df = (track_popularity_df
+        .where(F.col('train_frequency') >= F.lit(MIN_CANDIDATE_POPULARITY))
         .select(
-            F.col("track_id").alias("candidate_track_id"),
-            F.col("train_frequency").alias("candidate_popularity"),
-        )
+            F.col('track_id').alias('candidate_track_id'),
+            F.col('train_frequency').alias('candidate_popularity'))
     )
 
-    context_rows_df = train_source_df.select(
-        F.col("pid"),
-        F.col("track_id").alias("context_track_id"),
-    )
-    candidate_rows_df = (
-        train_source_df.join(
-            recommendable_tracks_df.select("candidate_track_id"),
-            train_source_df.track_id == F.col("candidate_track_id"),
-            how="inner",
-        )
+    context_rows_df = (train_source_df
         .select(
-            train_source_df.pid.alias("pid"),
-            F.col("candidate_track_id"),
-        )
+            'pid', 
+            F.col('track_id').alias('context_track_id'))
+    )
+    
+    candidate_rows_df = (train_source_df
+        .join(recommendable_tracks_df, F.col('track_id') == F.col('candidate_track_id'), how='inner')
+        .select('pid', 'candidate_track_id')
     )
 
-    return (
-        context_rows_df.join(candidate_rows_df, on="pid", how="inner")
-        .where(F.col("context_track_id") != F.col("candidate_track_id"))
-        .groupBy("context_track_id", "candidate_track_id")
-        .agg(F.count(F.lit(1)).cast("long").alias("pair_support"))
-        .where(F.col("pair_support") >= F.lit(min_pair_support))
-        .join(recommendable_tracks_df, on="candidate_track_id", how="inner")
-        .select("context_track_id", "candidate_track_id", "pair_support", "candidate_popularity")
+    pairs_df = (context_rows_df
+        .join(candidate_rows_df, on='pid', how='inner')
+        .where(F.col('context_track_id') != F.col('candidate_track_id'))
+        .groupBy('context_track_id', 'candidate_track_id')
+        .agg(F.count(F.lit(1)).cast('long').alias('pair_support'))
+        .where(F.col('pair_support') >= F.lit(MIN_PAIR_SUPPORT))
+    )
+    
+    # Popular tracks will explode the join, so limit to the 200 strongest pairs per context track.
+    top_pairs_window = (Window
+        .partitionBy('context_track_id')
+        .orderBy(F.desc('pair_support'), F.asc('candidate_track_id'))
     )
 
-
-# Builds the co-occurrence baseline by scoring candidate tracks against all context tracks in each playlist.
-# main() uses this after the pair table is built so validation playlists can get top-K ranked candidates.
-def build_cooccurrence_recommendations(validation_context_df, cooccurrence_pairs_df, max_k):
-    context_tracks_df = validation_context_df.select("pid", "track_id").where(F.col("track_id").isNotNull())
-    context_filter_df = context_tracks_df.select("pid", "track_id").distinct()
-
-    cooccurrence_rank_window = Window.partitionBy("pid").orderBy(
-        F.desc("score"),
-        F.desc("candidate_popularity"),
-        F.asc("track_id"),
+    return (pairs_df
+        .withColumn('pair_rank', F.row_number().over(top_pairs_window))
+        .where(F.col('pair_rank') <= F.lit(MAX_PAIRS_PER_TRACK))
+        .join(recommendable_tracks_df, on='candidate_track_id', how='inner')
+        .select('context_track_id', 'candidate_track_id', 'pair_support', 'candidate_popularity')
     )
 
-    return (
-        context_tracks_df.select(
-            "pid",
-            F.col("track_id").alias("context_track_id"),
-        )
-        .join(cooccurrence_pairs_df, on="context_track_id", how="inner")
-        .groupBy("pid", F.col("candidate_track_id").alias("track_id"))
+# Cooccurrence Baseline: Every track-track pair counts from the sampled train playlists. Capped at 200 pairs for memory reasons.
+def build_cooccurrence_recommendations(context_df, cooccurrence_pairs_df, max_k):
+    context_tracks_df = context_df.select('pid', 'track_id').where(F.col('track_id').isNotNull())
+    context_filter_df = context_tracks_df.select('pid', 'track_id').distinct()
+
+    cooccurrence_rank_window = (Window
+        .partitionBy('pid')
+        .orderBy(F.desc('score'), F.desc('candidate_popularity'), F.asc('track_id'))
+    )
+
+    return (context_tracks_df
+        .select('pid', F.col('track_id').alias('context_track_id'))
+        .join(cooccurrence_pairs_df, on='context_track_id', how='inner')
+        .groupBy('pid', F.col('candidate_track_id').alias('track_id'))
         .agg(
-            F.sum("pair_support").cast("double").alias("score"),
-            F.first("candidate_popularity", ignorenulls=True).alias("candidate_popularity"),
-        )
-        .join(context_filter_df, on=["pid", "track_id"], how="left_anti")
-        .withColumn("rank", F.row_number().over(cooccurrence_rank_window))
-        .where(F.col("rank") <= F.lit(max_k))
-        .withColumn("baseline_name", F.lit("cooccurrence"))
-        .select("baseline_name", "pid", "rank", "track_id", "score")
+            F.sum('pair_support').cast('double').alias('score'),
+            F.first('candidate_popularity', ignorenulls=True).alias('candidate_popularity'))
+        .join(context_filter_df, on=['pid', 'track_id'], how='left_anti')
+        .withColumn('rank', F.row_number().over(cooccurrence_rank_window))
+        .where(F.col('rank') <= F.lit(max_k))
+        .withColumn('baseline_name', F.lit('cooccurrence'))
+        .select('baseline_name', 'pid', 'rank', 'track_id', 'score')
     )
 
-
-# Builds a tiny lookup table for ideal DCG so NDCG can be computed without a UDF.
-# compute_metrics() uses this for each K value when it turns playlist-level hits into NDCG.
-def build_idcg_lookup(spark, max_target_count, k_value):
+# Ideal DCG for every target, used as denom for NDCG metric
+def build_idcg_lookup(spark, k_value):
     rows = []
-    for target_count in range(1, max_target_count + 1):
-        ideal_rank_count = min(target_count, k_value)
-        idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, ideal_rank_count + 1))
+    for target_count in range(1, MAX_HIDDEN + 1):
+        idcg = sum(1.0 / math.log2(rank + 1) for rank in range(1, min(target_count, k_value) + 1))
         rows.append((target_count, float(idcg)))
 
-    return spark.createDataFrame(rows, ["target_count", "idcg"])
+    return spark.createDataFrame(rows, ['target_count', 'idcg'])
 
+# Evaluates on Recall@K, Precison@K, and NDCG@K for each baseline. Evaluate.py uses these same definitions
+def compute_metrics(spark, recommendations_df, targets_df):
+    target_relevance_df = targets_df.select('pid', 'track_id').distinct().persist(StorageLevel.MEMORY_AND_DISK)
+    target_counts_df = target_relevance_df.groupBy('pid').agg(F.count(F.lit(1)).cast('int').alias('target_count')).persist(StorageLevel.MEMORY_AND_DISK)
+    baseline_names_df = spark.createDataFrame([(name,) for name in BASELINES], ['baseline_name'])
 
-# Evaluates all baseline recommendations against the deduplicated validation targets.
-# main() uses this after recommendations are built so the milestone ends with real benchmark metrics.
-def compute_metrics(spark, recommendations_df, validation_targets_df, k_values):
-    target_relevance_df = validation_targets_df.select("pid", "track_id").distinct().persist(StorageLevel.MEMORY_AND_DISK)
-    target_counts_df = target_relevance_df.groupBy("pid").agg(F.count(F.lit(1)).cast("int").alias("target_count")).persist(StorageLevel.MEMORY_AND_DISK)
-    evaluation_pids_df = target_counts_df.select("pid")
-    baseline_names_df = spark.createDataFrame(
-        [("popularity",), ("cooccurrence",)],
-        ["baseline_name"],
-    )
-    evaluation_grid_df = baseline_names_df.crossJoin(evaluation_pids_df).persist(StorageLevel.MEMORY_AND_DISK)
-    max_target_count = target_counts_df.agg(F.max("target_count").alias("max_target_count")).first()["max_target_count"]
+    # Every baseline crossed with every playlist
+    evaluation_grid_df = baseline_names_df.crossJoin(target_counts_df.select('pid')).persist(StorageLevel.MEMORY_AND_DISK)
 
-    metrics_by_baseline = {
-        "popularity": {},
-        "cooccurrence": {},
-    }
+    metrics_by_baseline = {name: {} for name in BASELINES}
 
-    for k_value in k_values:
-        idcg_lookup_df = build_idcg_lookup(spark, max_target_count, k_value)
-        hits_df = (
-            recommendations_df.where(F.col("rank") <= F.lit(k_value))
-            .join(target_relevance_df.withColumn("is_relevant", F.lit(1.0)), on=["pid", "track_id"], how="left")
-            .withColumn("is_hit", F.when(F.col("is_relevant").isNotNull(), F.lit(1.0)).otherwise(F.lit(0.0)))
-            .withColumn("dcg_contribution", F.col("is_hit") / F.log2(F.col("rank") + F.lit(1.0)))
-            .groupBy("baseline_name", "pid")
+    for k_value in K_VALUES:
+        idcg_lookup_df = build_idcg_lookup(spark, k_value)
+        hits_df = (recommendations_df
+            .where(F.col('rank') <= F.lit(k_value))
+            .join(target_relevance_df.withColumn('is_relevant', F.lit(1.0)), on=['pid', 'track_id'], how='left')
+            .withColumn('is_hit', F.when(F.col('is_relevant').isNotNull(), F.lit(1.0)).otherwise(F.lit(0.0)))
+            .withColumn('dcg_contribution', F.col('is_hit') / F.log2(F.col('rank') + F.lit(1.0)))
+            .groupBy('baseline_name', 'pid')
             .agg(
-                F.sum("is_hit").alias("hit_count"),
-                F.sum("dcg_contribution").alias("dcg"),
-            )
+                F.sum('is_hit').alias('hit_count'),
+                F.sum('dcg_contribution').alias('dcg'))
         )
 
-        metric_rows = (
-            evaluation_grid_df.join(target_counts_df, on="pid", how="inner")
-            .join(idcg_lookup_df, on="target_count", how="left")
-            .join(hits_df, on=["baseline_name", "pid"], how="left")
-            .fillna({"hit_count": 0.0, "dcg": 0.0})
-            .withColumn("recall", F.col("hit_count") / F.col("target_count"))
-            .withColumn("precision", F.col("hit_count") / F.lit(float(k_value)))
-            .withColumn(
-                "ndcg",
-                F.when(F.col("idcg") > F.lit(0.0), F.col("dcg") / F.col("idcg")).otherwise(F.lit(0.0)),
-            )
-            .groupBy("baseline_name")
+        metric_rows = (evaluation_grid_df
+            .join(target_counts_df, on='pid', how='inner')
+            .join(idcg_lookup_df, on='target_count', how='left')
+            .join(hits_df, on=['baseline_name', 'pid'], how='left')
+            .fillna({'hit_count': 0.0, 'dcg': 0.0})
+            .withColumn('recall', F.col('hit_count') / F.col('target_count'))
+            .withColumn('precision', F.col('hit_count') / F.lit(float(k_value)))
+            .withColumn('ndcg',
+                F.when(F.col('idcg') > F.lit(0.0), F.col('dcg') / F.col('idcg')).otherwise(F.lit(0.0)))
+            .groupBy('baseline_name')
             .agg(
-                F.avg("recall").alias("recall"),
-                F.avg("precision").alias("precision"),
-                F.avg("ndcg").alias("ndcg"),
-            )
+                F.avg('recall').alias('recall'),
+                F.avg('precision').alias('precision'),
+                F.avg('ndcg').alias('ndcg'))
             .collect()
         )
 
         for row in metric_rows:
-            metrics_by_baseline[row["baseline_name"]][f"Recall@{k_value}"] = float(row["recall"])
-            metrics_by_baseline[row["baseline_name"]][f"Precision@{k_value}"] = float(row["precision"])
-            metrics_by_baseline[row["baseline_name"]][f"NDCG@{k_value}"] = float(row["ndcg"])
+            metrics_by_baseline[row['baseline_name']][f'Recall@{k_value}'] = float(row['recall'])
+            metrics_by_baseline[row['baseline_name']][f'Precision@{k_value}'] = float(row['precision'])
+            metrics_by_baseline[row['baseline_name']][f'NDCG@{k_value}'] = float(row['ndcg'])
 
     target_relevance_df.unpersist()
     target_counts_df.unpersist()
     evaluation_grid_df.unpersist()
+
     return metrics_by_baseline
 
+# Scores a split (val/test) on both baselines (popularity/cooccurrence) and writes its metrics 
+def score_split(spark, split, context_df, targets_df, track_popularity_df, cooccurrence_pairs_df, output_root, max_k):
+    context_df = context_df.where(F.col('track_id').isNotNull()).select('pid', 'track_id')
+    scored_playlists = context_df.select('pid').distinct().count()
 
-# Writes the metrics summary as JSON so the notebook and Azure runs both have one simple artifact to inspect.
-# main() calls this after Spark metrics are collected back to Python dictionaries.
-def write_metrics_json(metrics_by_baseline, metrics_path):
-    output_payload = {
-        "baselines": metrics_by_baseline,
-    }
-    metrics_path.write_text(json.dumps(output_payload, indent=2, sort_keys=True))
+    popularity_recommendations_df = build_popularity_recommendations(context_df, track_popularity_df, max_k)
+    cooccurrence_recommendations_df = build_cooccurrence_recommendations(context_df, cooccurrence_pairs_df, max_k)
 
+    # Land the recommendations on disk and read them back. Holding 10M rows in memory while the metric joins run over them is what blows the heap.
+    recommendations_path = output_root / f'{split}_recommendations.parquet'
+    recommendations_df = popularity_recommendations_df.unionByName(cooccurrence_recommendations_df)
+    recommendations_df.write.mode('overwrite').parquet(str(recommendations_path))
+    recommendations_df = spark.read.parquet(str(recommendations_path))
 
-# ArgumentParser lets us run the same script locally on a sample or later on Azure with full data.
-# main() calls this first so both execution modes share one interface.
-def parse_args():
-    parser = argparse.ArgumentParser(description="Run popularity and co-occurrence baselines on the gold Parquet tables.")
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--driver-memory", default="8g")
-    parser.add_argument("--full-data", action="store_true")
-    parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args()
+    metrics_by_baseline = compute_metrics(spark, recommendations_df, targets_df)
 
+    (output_root / f'{split}_metrics.json').write_text(json.dumps({'split': split, 'baselines': metrics_by_baseline}, indent=2, sort_keys=True))
 
-# Uses the helper functions to sample data, build baselines, score recommendations, and write artifacts.
-# This is the one place where the local sample workflow and later Azure full-data workflow stay identical.
+    return metrics_by_baseline, scored_playlists
+
 def main():
-    args = parse_args()
     max_k = max(K_VALUES)
-    
-    output_root = Path(args.output) # creates a Path object to data/silver where the Parquet tables will be stored
-    output_root.mkdir(parents=True, exist_ok=True) # creates the output directory data/silver if it doesn't exist already
-    
-    # Creates path for each parquet table write
-    popularity_path = output_root / "track_popularity.parquet"
-    cooccurrence_pairs_path = output_root / "cooccurrence_pairs.parquet"
-    recommendations_path = output_root / "validation_recommendations.parquet"
-    metrics_path = output_root / "validation_metrics.json"
-    write_mode = "overwrite" if args.overwrite else "errorifexists" # if we use --overwrite in CLI, then MPD file ingestion overwrites all old files in data/silver/{path}
 
-    # Creates SparkSession
-    spark = create_spark_session(args.driver_memory)
+    output_root = Path(OUTPUT_DIR)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    spark = create_spark_session()
 
     try:
-        train_df, validation_context_df, validation_targets_df = read_gold_tables(args.input, spark)
-        run_train_df, run_validation_context_df, run_validation_targets_df = build_run_tables(
-            train_df,
-            validation_context_df,
-            validation_targets_df,
-            SEED, TRAIN_SAMPLE_SIZE, VALIDATION_SAMPLE_SIZE,
-            args.full_data, # defaults to False, unless add --full_data in CLI script run
+        train_df, eval_tables = read_gold_tables(spark)
+        train_df = (train_df
+            .where(F.col('track_id').isNotNull())
+            .select('pid', 'track_id')
+            .persist(StorageLevel.MEMORY_AND_DISK)
         )
-        # .persist(StorageLevel.MEMORY_AND_DISK) -> persist/cache the DataFrame so it doesn't recompute it on every run, use memory first and spill into disk if need be.
-        run_train_df = run_train_df.persist(StorageLevel.MEMORY_AND_DISK)
-        run_validation_context_df = run_validation_context_df.persist(StorageLevel.MEMORY_AND_DISK)
-        run_validation_targets_df = run_validation_targets_df.persist(StorageLevel.MEMORY_AND_DISK)
 
-        track_popularity_df = build_track_popularity(run_train_df).persist(StorageLevel.MEMORY_AND_DISK)
-        popularity_recommendations_df = build_popularity_recommendations(run_validation_context_df, track_popularity_df, max_k)
-        cooccurrence_pairs_df = build_cooccurrence_pairs(
-            run_train_df,
-            track_popularity_df,
-            MIN_PAIR_SUPPORT, MIN_CANDIDATE_POPULARITY,
-        ).persist(StorageLevel.MEMORY_AND_DISK)
-        cooccurrence_recommendations_df = build_cooccurrence_recommendations(
-            run_validation_context_df, 
-            cooccurrence_pairs_df,
-            max_k,
-        )
-        recommendations_df = popularity_recommendations_df.unionByName(cooccurrence_recommendations_df).persist(StorageLevel.MEMORY_AND_DISK)
-        metrics_by_baseline = compute_metrics(spark, recommendations_df, run_validation_targets_df, K_VALUES)
-        
-        # Writes train/val/test tables to parquet in artifacts/baselines/sample
-        track_popularity_df.write.mode(write_mode).parquet(str(popularity_path))
-        cooccurrence_pairs_df.write.mode(write_mode).parquet(str(cooccurrence_pairs_path))
-        recommendations_df.write.mode(write_mode).parquet(str(recommendations_path))
-        
-        # Validation summary
-        write_metrics_json(metrics_by_baseline, metrics_path)
+        # popularity on 900k train playlists
+        popularity_path = output_root / 'track_popularity.parquet'
+        build_track_popularity(train_df).write.mode('overwrite').parquet(str(popularity_path))
+        track_popularity_df = spark.read.parquet(str(popularity_path))
 
-        sampled_train_playlists = run_train_df.select("pid").distinct().count()
-        sampled_validation_playlists = run_validation_context_df.select("pid").distinct().count()
+        # cooccurrence on 50k sampled train playlists
+        cooccurrence_train_df = train_df.join(select_sample_pids(train_df, COOCCURRENCE_SAMPLE_SIZE), on='pid', how='inner')
+        pairs_path = output_root / 'cooccurrence_pairs.parquet'
+        build_cooccurrence_pairs(cooccurrence_train_df, track_popularity_df).write.mode('overwrite').parquet(str(pairs_path))
+        cooccurrence_pairs_df = spark.read.parquet(str(pairs_path))
+
         summary = {
-            "full_data_mode": bool(args.full_data),
-            "input_path": str(Path(args.input)),
-            "output_path": str(output_root),
-            "k_values": K_VALUES,
-            "sampled_train_playlists": sampled_train_playlists,
-            "sampled_validation_playlists": sampled_validation_playlists,
-            "track_popularity_path": str(popularity_path),
-            "cooccurrence_pairs_path": str(cooccurrence_pairs_path),
-            "recommendations_path": str(recommendations_path),
-            "metrics_path": str(metrics_path),
-            "metrics": metrics_by_baseline,
+            'output_path': str(output_root),
+            'k_values': K_VALUES,
+            'popularity_train_playlists': train_df.select('pid').distinct().count(),
+            'cooccurrence_train_playlists': COOCCURRENCE_SAMPLE_SIZE,
+            'splits': {}
         }
-        print(json.dumps(summary, indent=2, sort_keys=True))
+        
+        train_df.unpersist()
+
+        for split in SPLITS:
+            context_df, targets_df = eval_tables[split]
+            metrics_by_baseline, scored_playlists = score_split(spark, split, context_df, targets_df, track_popularity_df, cooccurrence_pairs_df, output_root, max_k)
+            summary['splits'][split] = {'scored_playlists': scored_playlists, 'metrics': metrics_by_baseline}
+
+        print(json.dumps(summary, indent=2))
+        
     finally:
-        spark.stop()  # Closes spark connection
+        spark.stop()
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
