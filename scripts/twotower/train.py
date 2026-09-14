@@ -1,7 +1,5 @@
 # Trains the two-tower model on the cached playlists from dataset.py.
-# Auto-detects the device, so the same command runs on CPU locally and on a GPU on Kaggle.
-#
-#     python3 scripts/twotower/train.py --dim 128 --hidden-dims 256 --batch-size 4096 --epochs 30 --logq
+# Full train done on Kaggle with T4 GPU
 
 # Import Libraries
 import argparse
@@ -14,152 +12,134 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1])) # so "twotower" resolves when run as a script
-from twotower.dataset import PlaylistDataset, make_dataloader  # noqa: E402
-from twotower.model import build_model_from_vocab_sizes  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from twotower.dataset import PlaylistDataset, make_dataloader
+from twotower.model import build_model_from_vocab_sizes
 
+CACHE_PATH = 'artifacts/twotower/train_playlists.npz'
+VOCAB_DIR = 'artifacts/vocab'
+CHECKPOINT_DIR = 'artifacts/twotower/checkpoints'
 
-def select_device(requested):
-    if requested != "auto":
-        return torch.device(requested)
+SEED = 42
+MAX_CONTEXT_LEN = 100
+NUM_WORKERS = 2
+LOG_EVERY = 50
+
+def select_device():
     if torch.cuda.is_available():
-        return torch.device("cuda")
+        return torch.device('cuda')
     if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+        return torch.device('mps')
 
+    return torch.device('cpu')
 
-# "256" gives one hidden layer, "256,256" gives two, empty leaves the towers linear.
-def parse_hidden_dims(spec):
-    if not spec or spec.strip().lower() in {"none", "0"}:
-        return None
-    return [int(part) for part in spec.split(",") if part.strip()]
+def load_vocab_sizes():
+    return json.loads((Path(VOCAB_DIR) / 'vocab_metadata.json').read_text())['vocab_sizes']
 
+# How often each track appears in train, which is what the logQ correction divides out
+def compute_item_counts(num_tracks):
+    counts = np.bincount(np.load(CACHE_PATH)['track_idx'], minlength=num_tracks)
 
-def load_vocab_sizes(vocab_dir):
-    meta = json.loads((Path(vocab_dir) / "vocab_metadata.json").read_text())
-    return {e: meta["entities"][e]["vocab_size"] for e in ("track", "artist", "album")}
-
-
-# How often each track appears in train, which is what the logQ correction divides out.
-def compute_item_counts(cache_path, num_tracks):
-    counts = np.bincount(np.load(cache_path)["track_idx"], minlength=num_tracks)
     return torch.from_numpy(counts)
 
-
-# Fraction of playlists whose own positive wins its row. A quick "is it learning" readout,
-# the real metrics come from evaluate.py.
+# Proportion of playlists in-batch whose "positive" track was identified. In-training metric to follow progress, not a final eval metric
 def in_batch_accuracy(playlist_vec, item_vec):
     logits = F.normalize(playlist_vec, dim=-1) @ F.normalize(item_vec, dim=-1).t()
     targets = torch.arange(logits.size(0), device=logits.device)
+
     return (logits.argmax(dim=1) == targets).float().mean().item()
 
-
-# One pass over the loader. Returns (avg_loss, avg_acc, updated_global_step).
-def train_one_epoch(model, loader, optimizer, device, epoch, log_every=50, max_steps=0, global_step=0):
+def train_one_epoch(model, loader, optimizer, device, epoch):
     model.train()
     total_loss, total_acc, n_batches = 0.0, 0.0, 0
 
+    # Loop through dataloader, batches of B (4096) playlists
     for step, batch in enumerate(loader):
-        batch = {k: v.to(device) for k, v in batch.items()}
+        for k in batch:
+            batch[k] = batch[k].to(device)
+            
+        # calls model.forward(), shapes: playlist_vec [B, dim], item_vec [B, dim]
         playlist_vec, item_vec = model(batch)
-        loss = model.in_batch_softmax_loss(playlist_vec, item_vec, item_indices=batch["pos_track"])
+        loss = model.in_batch_softmax_loss(playlist_vec, item_vec, item_indices=batch['pos_track'])
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        optimizer.zero_grad() # clears previous gradients
+        loss.backward() # calculates gradients for params in-batch
+        optimizer.step() # updates params with gradients
 
         with torch.no_grad():
             acc = in_batch_accuracy(playlist_vec, item_vec)
         total_loss += loss.item()
         total_acc += acc
         n_batches += 1
-        global_step += 1
 
-        if step % log_every == 0:
-            print(f"  epoch {epoch}  step {step:>6d}  loss {loss.item():.4f}  in-batch acc {acc:.3f}")
-        if max_steps and global_step >= max_steps:
-            break
+        if step % LOG_EVERY == 0:
+            print(f'  epoch: {epoch}  step: {step:>6d}  loss: {loss.item():.4f}  in-batch acc: {acc:.3f}')
 
-    return total_loss / max(n_batches, 1), total_acc / max(n_batches, 1), global_step
+    avg_total_loss = total_loss / n_batches
+    avg_total_acc = total_acc / n_batches
+    
+    return avg_total_loss, avg_total_acc
 
-
-# Model weights only, no optimizer state, since I never resume a run.
+# Saves model weights, epoch, and config to a .pt file
 def save_checkpoint(path, model, epoch, config):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"epoch": epoch, "model_state_dict": model.state_dict(), "config": config}, path)
-
+    torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'config': config}, path)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train the two-tower retrieval model.")
-    parser.add_argument("--cache", default="artifacts/twotower/train_playlists.npz")
-    parser.add_argument("--vocab-dir", default="artifacts/vocab")
-    parser.add_argument("--out", default="artifacts/twotower/checkpoints")
-    parser.add_argument("--dim", type=int, default=128)
-    parser.add_argument("--hidden-dims", default="") # "256" for one MLP layer, empty for linear towers
-    parser.add_argument("--temperature", type=float, default=0.05)
-    parser.add_argument("--batch-size", type=int, default=1024) # also the in-batch negative count
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--max-context-len", type=int, default=100)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--device", default="auto")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-steps", type=int, default=0)
-    parser.add_argument("--logq", action="store_true") # debias negatives by track popularity
-    return parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dim', type=int, default=128)
+    parser.add_argument('--hidden-dims', type=int, nargs='*', default=[]) 
+    parser.add_argument('--temperature', type=float, default=0.05)
+    parser.add_argument('--batch-size', type=int, default=1024) 
+    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--logq', action='store_true') # debias negatives by track popularity
 
+    return parser.parse_args()
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
 
-    device = select_device(args.device)
-    vocab_sizes = load_vocab_sizes(args.vocab_dir)
-    hidden_dims = parse_hidden_dims(args.hidden_dims)
+    device = select_device()
+    vocab_sizes = load_vocab_sizes()
 
-    model = build_model_from_vocab_sizes(
-        vocab_sizes, embedding_dim=args.dim, temperature=args.temperature, hidden_dims=hidden_dims,
-    ).to(device)
+    model = build_model_from_vocab_sizes(vocab_sizes, embedding_dim=args.dim, temperature=args.temperature, hidden_dims=args.hidden_dims).to(device)
 
     if args.logq:
-        model.set_item_log_q(compute_item_counts(args.cache, vocab_sizes["track"]).to(device))
+        model.set_item_log_q(compute_item_counts(vocab_sizes['track']).to(device))
 
-    dataset = PlaylistDataset(args.cache, max_context_len=args.max_context_len)
-    loader = make_dataloader(dataset, args.batch_size, num_workers=args.num_workers, seed=args.seed)
-    print(f"{device}, dim {args.dim}, head {hidden_dims or 'linear'}, logQ {bool(args.logq)}, "
-          f"{len(dataset):,} playlists")
+    # Build dataset & dataloader 
+    dataset = PlaylistDataset(CACHE_PATH, max_context_len=MAX_CONTEXT_LEN)
+    loader = make_dataloader(dataset, args.batch_size, NUM_WORKERS, SEED)
+    print(f'device: {device}, dim: {args.dim}, hidden: {args.hidden_dims or "linear"}, logQ: {bool(args.logq)}, {len(dataset):,} playlists')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    # evaluate.py rebuilds the model from this, so it rides along in the checkpoint.
+    # evaluate.py uses same hyperparams
     config = {
-        "vocab_sizes": vocab_sizes,
-        "embedding_dim": args.dim,
-        "temperature": args.temperature,
-        "hidden_dims": hidden_dims,
-        "logq": bool(args.logq),
+        'vocab_sizes': vocab_sizes,
+        'embedding_dim': args.dim,
+        'temperature': args.temperature,
+        'hidden_dims': args.hidden_dims,
+        'logq': bool(args.logq)
     }
 
-    best_acc, global_step = -1.0, 0
+    checkpoint_path = Path(CHECKPOINT_DIR) / 'best.pt'
+    best_acc = -1.0
     for epoch in range(1, args.epochs + 1):
         start = time.time()
-        avg_loss, avg_acc, global_step = train_one_epoch(
-            model, loader, optimizer, device, epoch, max_steps=args.max_steps, global_step=global_step,
-        )
-        print(f"epoch {epoch} done  avg loss {avg_loss:.4f}  avg in-batch acc {avg_acc:.3f}  ({time.time() - start:.1f}s)")
+        avg_loss, avg_acc = train_one_epoch(model, loader, optimizer, device, epoch)
+        print(f'epoch {epoch} done, avg loss {avg_loss:.4f},  avg in-batch acc {avg_acc:.3f}  ({time.time() - start:.1f}s)')
 
+        # If the in-batch accuracy is better than the best so far, save the model weights to best.pt
         if avg_acc > best_acc:
             best_acc = avg_acc
-            save_checkpoint(Path(args.out) / "best.pt", model, epoch, config)
+            save_checkpoint(checkpoint_path, model, epoch, config)
 
-        if args.max_steps and global_step >= args.max_steps:
-            break
+    print(f'done, best in-batch acc {best_acc:.4f}, saved to {checkpoint_path}')
 
-    print(f"done, best in-batch acc {best_acc:.4f}, saved {Path(args.out) / 'best.pt'}")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
