@@ -32,6 +32,7 @@ I also tried a deeper [256, 256] head and a bigger 8192 batch. Both were measure
 - [`scripts/build_splits.py`](scripts/build_splits.py) - deterministic 90/5/5 train/val/test split, for each val/test playlist it hides 20% of the tracks, capped at 10, as the positive targets to predict
 - [`scripts/run_baselines.py`](scripts/run_baselines.py) - the popularity and co-occurrence baselines, plus the Recall/Precision/NDCG@K definitions everything else reuses
 - [`scripts/build_vocab.py`](scripts/build_vocab.py) - maps 2.1M track, 283K artist, and 705K album string IDs to integer indices, with index 0 reserved for padding and 1 for unknown IDs
+- [`scripts/twotower/vocab.py`](scripts/twotower/vocab.py) - defines the Vocabulary class used across the repo so all IDs encode the same way
 - [`scripts/twotower/dataset.py`](scripts/twotower/dataset.py) - encodes the 60M row training table once into a flat `.npz` cache, each epoch samples one held-out positive per playlist and uses the rest as context
 - [`scripts/twotower/model.py`](scripts/twotower/model.py) - Defines the two-tower model. Both towers share track/artist/album embedding tables, the playlist tower mean-pools its context, and the loss is in-batch softmax with the logQ correction
 - [`scripts/twotower/train.py`](scripts/twotower/train.py) - training loop with hyperparams: dim, hidden_dims, temperature, epochs, batch_size, lr, logq
