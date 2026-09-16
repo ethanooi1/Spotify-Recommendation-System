@@ -52,6 +52,7 @@ pip install -r requirements.txt
 ```
 
 Spark 4.0 needs Java 17 (`export JAVA_HOME=$(/usr/libexec/java_home -v 17)` on macOS). 
+
 `data/bronze` expects the raw MPD JSON slices, Spotify removed the MPD dataset from public view, but I have it locally.
 
 The Spark stages run locally:

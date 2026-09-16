@@ -1,0 +1,7 @@
+{
+  "vocab_sizes": {
+    "track": 2149615,
+    "artist": 283484,
+    "album": 705027
+  }
+}

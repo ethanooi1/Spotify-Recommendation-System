@@ -7,11 +7,20 @@ __pycache__/
 .venv/
 venv/
 
-# Generated data outputs
-data/
-artifacts/
+# Generated data outputs, anchored so they only match the ones at the repo root
+/data/
+/artifacts/**
+!/artifacts/baselines/
+!/artifacts/baselines/*_metrics.json
+!/artifacts/vocab/
+!/artifacts/vocab/vocab_metadata.json
 
 # Personal learning material, not published
 NOTES.md
 notebooks/
 tests/
+personal/
+
+# My own playlist exports and their outputs stay local, the code that makes them doesn't
+recommendations/data/*.csv
+recommendations/artifacts/*.csv
