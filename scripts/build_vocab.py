@@ -55,11 +55,11 @@ def main():
         for column, name in ENTITIES.items():
             vocab = build_entity_vocabulary(train_df, column)
             vocab.save(output_root / f'{name}_vocab.json')
-            vocab_sizes[name] = vocab.size 
+            vocab_sizes[name] = vocab.size
             print(f'Built {name} vocab with {vocab.size} entries, saved to {output_root / f"{name}_vocab.json"}')
 
         (output_root / 'vocab_metadata.json').write_text(json.dumps({'vocab_sizes': vocab_sizes}, indent=2))
-        
+
     finally:
         spark.stop()
 

@@ -31,7 +31,7 @@ def create_spark_session():
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel('ERROR')
-    
+
     return spark
 
 # Training data, val for context+target, and test for context+target
@@ -47,13 +47,13 @@ def read_gold_tables(spark):
 
     return train_df, eval_tables
 
-# Samples playlists determinisitcally using hash splitting for cooccurrence split
+# Samples playlists deterministically using hash splitting for cooccurrence split
 def select_sample_pids(train_df, sample_size):
     return (train_df
         .select('pid').distinct()
         .withColumn('sample_score',
             F.pmod(
-                F.xxhash64(F.lit(str(SEED)),F.lit('train'),F.col('pid').cast('string')), 
+                F.xxhash64(F.lit(str(SEED)), F.lit('train'), F.col('pid').cast('string')),
                 F.lit(1000000)))
         .orderBy(F.col('sample_score'), F.col('pid'))
         .limit(sample_size)
@@ -81,7 +81,7 @@ def build_popularity_recommendations(context_df, track_popularity_df, max_k):
         .agg(F.max('unique_context_tracks').alias('max_unique_context_tracks'))
         .first()['max_unique_context_tracks']
     )
-    max_unique_context_tracks = 0 if max_unique_context_tracks is None else int(max_unique_context_tracks)
+    max_unique_context_tracks = int(max_unique_context_tracks)
 
     candidate_pool_df = (track_popularity_df
         .orderBy(F.asc('popularity_rank'))
@@ -106,7 +106,6 @@ def build_popularity_recommendations(context_df, track_popularity_df, max_k):
 
 # Builds track-track pairs across sampled train playlists. Capped at 200 pairs per context track
 def build_cooccurrence_pairs(train_df, track_popularity_df):
-    train_source_df = train_df.select('pid', 'track_id').where(F.col('track_id').isNotNull())
     recommendable_tracks_df = (track_popularity_df
         .where(F.col('train_frequency') >= F.lit(MIN_CANDIDATE_POPULARITY))
         .select(
@@ -114,13 +113,13 @@ def build_cooccurrence_pairs(train_df, track_popularity_df):
             F.col('train_frequency').alias('candidate_popularity'))
     )
 
-    context_rows_df = (train_source_df
+    context_rows_df = (train_df
         .select(
-            'pid', 
+            'pid',
             F.col('track_id').alias('context_track_id'))
     )
-    
-    candidate_rows_df = (train_source_df
+
+    candidate_rows_df = (train_df
         .join(recommendable_tracks_df, F.col('track_id') == F.col('candidate_track_id'), how='inner')
         .select('pid', 'candidate_track_id')
     )
@@ -132,7 +131,7 @@ def build_cooccurrence_pairs(train_df, track_popularity_df):
         .agg(F.count(F.lit(1)).cast('long').alias('pair_support'))
         .where(F.col('pair_support') >= F.lit(MIN_PAIR_SUPPORT))
     )
-    
+
     # Popular tracks will explode the join, so limit to the 200 strongest pairs per context track.
     top_pairs_window = (Window
         .partitionBy('context_track_id')
@@ -148,15 +147,14 @@ def build_cooccurrence_pairs(train_df, track_popularity_df):
 
 # Cooccurrence Baseline: Every track-track pair counts from the sampled train playlists. Capped at 200 pairs for memory reasons.
 def build_cooccurrence_recommendations(context_df, cooccurrence_pairs_df, max_k):
-    context_tracks_df = context_df.select('pid', 'track_id').where(F.col('track_id').isNotNull())
-    context_filter_df = context_tracks_df.select('pid', 'track_id').distinct()
+    context_filter_df = context_df.distinct()
 
     cooccurrence_rank_window = (Window
         .partitionBy('pid')
         .orderBy(F.desc('score'), F.desc('candidate_popularity'), F.asc('track_id'))
     )
 
-    return (context_tracks_df
+    return (context_df
         .select('pid', F.col('track_id').alias('context_track_id'))
         .join(cooccurrence_pairs_df, on='context_track_id', how='inner')
         .groupBy('pid', F.col('candidate_track_id').alias('track_id'))
@@ -179,7 +177,7 @@ def build_idcg_lookup(spark, k_value):
 
     return spark.createDataFrame(rows, ['target_count', 'idcg'])
 
-# Evaluates on Recall@K, Precison@K, and NDCG@K for each baseline. Evaluate.py uses these same definitions
+# Evaluates on Recall@K, Precision@K, and NDCG@K for each baseline. Evaluate.py uses these same definitions
 def compute_metrics(spark, recommendations_df, targets_df):
     target_relevance_df = targets_df.select('pid', 'track_id').distinct().persist(StorageLevel.MEMORY_AND_DISK)
     target_counts_df = target_relevance_df.groupBy('pid').agg(F.count(F.lit(1)).cast('int').alias('target_count')).persist(StorageLevel.MEMORY_AND_DISK)
@@ -195,8 +193,11 @@ def compute_metrics(spark, recommendations_df, targets_df):
         hits_df = (recommendations_df
             .where(F.col('rank') <= F.lit(k_value))
             .join(target_relevance_df.withColumn('is_relevant', F.lit(1.0)), on=['pid', 'track_id'], how='left')
-            .withColumn('is_hit', F.when(F.col('is_relevant').isNotNull(), F.lit(1.0)).otherwise(F.lit(0.0)))
-            .withColumn('dcg_contribution', F.col('is_hit') / F.log2(F.col('rank') + F.lit(1.0)))
+            .withColumn('is_hit', 
+                F.when(F.col('is_relevant').isNotNull(), F.lit(1.0))
+                 .otherwise(F.lit(0.0)))
+            .withColumn('dcg_contribution', 
+                F.col('is_hit') / F.log2(F.col('rank') + F.lit(1.0)))
             .groupBy('baseline_name', 'pid')
             .agg(
                 F.sum('is_hit').alias('hit_count'),
@@ -211,7 +212,8 @@ def compute_metrics(spark, recommendations_df, targets_df):
             .withColumn('recall', F.col('hit_count') / F.col('target_count'))
             .withColumn('precision', F.col('hit_count') / F.lit(float(k_value)))
             .withColumn('ndcg',
-                F.when(F.col('idcg') > F.lit(0.0), F.col('dcg') / F.col('idcg')).otherwise(F.lit(0.0)))
+                F.when(F.col('idcg') > F.lit(0.0), F.col('dcg') / F.col('idcg'))
+                 .otherwise(F.lit(0.0)))
             .groupBy('baseline_name')
             .agg(
                 F.avg('recall').alias('recall'),
@@ -231,7 +233,7 @@ def compute_metrics(spark, recommendations_df, targets_df):
 
     return metrics_by_baseline
 
-# Scores a split (val/test) on both baselines (popularity/cooccurrence) and writes its metrics 
+# Scores a split (val/test) on both baselines (popularity/cooccurrence) and writes its metrics
 def score_split(spark, split, context_df, targets_df, track_popularity_df, cooccurrence_pairs_df, output_root, max_k):
     context_df = context_df.where(F.col('track_id').isNotNull()).select('pid', 'track_id')
     scored_playlists = context_df.select('pid').distinct().count()
@@ -285,7 +287,7 @@ def main():
             'cooccurrence_train_playlists': COOCCURRENCE_SAMPLE_SIZE,
             'splits': {}
         }
-        
+
         train_df.unpersist()
 
         for split in SPLITS:
@@ -294,7 +296,7 @@ def main():
             summary['splits'][split] = {'scored_playlists': scored_playlists, 'metrics': metrics_by_baseline}
 
         print(json.dumps(summary, indent=2))
-        
+
     finally:
         spark.stop()
 

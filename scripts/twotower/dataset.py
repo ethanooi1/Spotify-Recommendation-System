@@ -84,7 +84,7 @@ def build_cache(spark):
     np.savez(output_path / 'train_playlists.npz', track_idx=track_idx, artist_idx=artist_idx, album_idx=album_idx, offsets=offsets, pids=pids)
 
     return {
-        'output_path': str(output_path), 
+        'output_path': str(output_path),
         'num_playlists': int(num_playlists),
         'num_occurrences': int(num_occurrences)
     }
@@ -110,7 +110,7 @@ class PlaylistDataset(Dataset):
         start = int(self.offsets[index])
         end = int(self.offsets[index + 1])
         pos = start + int(np.random.randint(end - start))
-        context = np.concat([np.arange(start, pos), np.arange(pos + 1, end)])
+        context = np.concatenate([np.arange(start, pos), np.arange(pos + 1, end)])
 
         # Playlists with > 100 tracks are sampled down to 100 tracks for their context pool
         if context.shape[0] > self.max_context_len:
@@ -127,14 +127,14 @@ class PlaylistDataset(Dataset):
         }
 
 # All playlists need to be the same length within a batch for in-batch negatives to work, so short playlists get padded with an empty row from the embedding table
-def collate_playlists(batch, pad_index=PAD_INDEX):
+def collate_playlists(batch):
     lengths = [s['context_track'].shape[0] for s in batch]
     max_len = max(lengths)
 
     out = {}
     for e in ENTITIES:
-        out[f'context_{e}'] = torch.full((len(batch), max_len), pad_index, dtype=torch.long)
-        
+        out[f'context_{e}'] = torch.full((len(batch), max_len), PAD_INDEX, dtype=torch.long)
+
     mask = torch.zeros((len(batch), max_len), dtype=torch.bool)
 
     # Fill the context tensors and create the mask. Shape: (4096, max_len)
@@ -143,14 +143,14 @@ def collate_playlists(batch, pad_index=PAD_INDEX):
         for entity in ENTITIES:
             out[f'context_{entity}'][i, :n] = sample[f'context_{entity}']
         mask[i, :n] = True
-    
+
     # The mask is used to ignore the padded cells. Shape: (4096, max_len)
     out['context_mask'] = mask
 
     # Turn the "positive" scalars into tensors Shape: (4096, )
     for key in ['pos_track', 'pos_artist', 'pos_album', 'pid']:
         out[key] = torch.stack([s[key] for s in batch])
-    
+
     return out
 
 # Reset the RNG for each worker per epoch, but keep the seed deterministic
@@ -174,10 +174,10 @@ def make_dataloader(dataset, batch_size, num_workers, seed):
 
 def main():
     spark = create_spark_session()
-    
+
     try:
         print(json.dumps(build_cache(spark), indent=2))
-        
+
     finally:
         spark.stop()
 

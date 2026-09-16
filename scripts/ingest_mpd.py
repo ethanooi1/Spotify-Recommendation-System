@@ -26,7 +26,7 @@ def create_spark_session():
 
     return spark
 
-# Mirror the MPD schema for ingestion 
+# Mirror the MPD schema for ingestion
 TRACK_SCHEMA = StructType(
     [
         StructField('track_uri', StringType(), True),
@@ -104,6 +104,7 @@ def build_playlists(playlist_rows):
             F.regexp_extract('source_file', SLICE_RANGE_PATTERN, 2).cast('int').alias('slice_end'))
         .where(F.col('pid').isNotNull())
     )
+
 # Every unique track URI is a row
 def build_tracks(playlist_rows):
     return (playlist_rows
@@ -133,6 +134,7 @@ def build_tracks(playlist_rows):
             F.first('album_name', ignorenulls=True).alias('album_name'),
             F.first('duration_ms', ignorenulls=True).alias('duration_ms'))
     )
+
 # Every playlist-track pair is a row
 def build_playlist_tracks(playlist_rows):
     return (playlist_rows
@@ -158,7 +160,7 @@ def main():
 
     output_root = Path(OUTPUT_DIR)
     output_root.mkdir(parents=True, exist_ok=True)
-    
+
     playlists_path = output_root / 'playlists.parquet'
     tracks_path = output_root / 'tracks.parquet'
     playlist_tracks_path = output_root / 'playlist_tracks.parquet'
@@ -186,9 +188,9 @@ def main():
             'playlists_path': str(playlists_path),
             'playlist_tracks_path': str(playlist_tracks_path)
         }
-        
+
         print(json.dumps(summary, indent=2))
-        
+
     finally:
         spark.stop()
 

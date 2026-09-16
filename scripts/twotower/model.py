@@ -1,4 +1,4 @@
-# The two-tower model. 
+# The two-tower model.
 # One tower averages a playlist's context tracks into a single vector, the other tower encodes a single candidate track.
 # Both towers read from the same 3 embedding tables (artist, album, track) so their vectors are directly comparable and live in the same N-dimensional space
 
@@ -25,10 +25,10 @@ def build_mlp(dim, hidden_dims):
     for hidden in hidden_dims:
         layers += [nn.Linear(prev, hidden), nn.ReLU()]
         prev = hidden
-        
+
     layers.append(nn.Linear(prev, dim)) # back to dim, no activation
 
-    # nn.Sequential on init takes a list of layers (nn.Linear, nn.ReLu, etc.). 
+    # nn.Sequential on init takes a list of layers (nn.Linear, nn.ReLu, etc.).
     # On call it passes an input tensor (batch_size, dim) through each layer in order, returning the final output tensor (batch_size, dim)
     return nn.Sequential(*layers)
 
@@ -86,13 +86,15 @@ class TwoTowerModel(nn.Module):
         return playlist_vec, item_vec
 
     # Scores batch_size (B) playlists against their positives, gives a [B, B] matrix where each (i, i) pair is the positive match
-    # All other (i, j) pairs are in-batch negatives, B-1 negatives per playlist, 1 positive per playlist 
+    # All other (i, j) pairs are in-batch negatives, B-1 negatives per playlist, 1 positive per playlist
     def in_batch_softmax_loss(self, playlist_vec, item_vec, item_indices):
         # Build unit vectors for playlist & item vector
         playlist_vec = F.normalize(playlist_vec, dim=-1)
         item_vec = F.normalize(item_vec, dim=-1)
+
         # Cosine similarity calculation, logits shape: (batch_size, batch_size)
         logits = playlist_vec @ item_vec.t() / self.temperature
+
         # logQ correction
         logits = logits - self.item_log_q[item_indices].unsqueeze(0)
 

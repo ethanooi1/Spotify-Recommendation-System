@@ -1,10 +1,3 @@
-# Evaluates a trained model with full-catalog retrieval. For each eval playlist it encodes the
-# visible context, scores that against every track in the MPD, and checks the top K against the
-# hidden targets. The metric definitions match run_baselines.py so the numbers line up with the
-# popularity and co-occurrence baselines.
-#
-#     python3 scripts/twotower/evaluate.py --split validation
-
 # Import Libraries
 import argparse
 import json
@@ -30,6 +23,8 @@ BASELINE_DIR = 'artifacts/baselines'
 
 ENTITIES = ['track', 'artist', 'album']
 K_VALUES = [10, 50, 100]
+ITEM_CHUNK = 200000
+PLAYLIST_CHUNK = 256
 UNK_INDEX = Vocabulary.UNK_INDEX
 PAD_INDEX = Vocabulary.PAD_INDEX
 
@@ -44,7 +39,7 @@ def load_model(checkpoint_path, device):
     return model.to(device), cfg
 
 # Encodes every track into an item vector for easy cosine similarity retrieval
-def build_item_index(model, cache_path, device, encode_chunk_size=200000):
+def build_item_index(model, cache_path, device):
     data = np.load(cache_path)
     track_idx, artist_idx, album_idx = data['track_idx'], data['artist_idx'], data['album_idx']
     num_tracks = int(track_idx.max()) + 1
@@ -58,8 +53,8 @@ def build_item_index(model, cache_path, device, encode_chunk_size=200000):
 
     item_vecs = torch.empty(num_tracks, model.embedding_dim, device=device)
     with torch.no_grad():
-        for start in range(0, num_tracks, encode_chunk_size):
-            end = min(start + encode_chunk_size, num_tracks)
+        for start in range(0, num_tracks, ITEM_CHUNK):
+            end = min(start + ITEM_CHUNK, num_tracks)
             vecs = model.encode_item(
                 torch.arange(start, end, device=device),
                 torch.from_numpy(track_to_artist[start:end]).to(device),
@@ -104,7 +99,7 @@ def load_eval_playlists(split, vocabs):
 
     return playlists
 
-# Similar to dataset.py, collate_playlist(). Needs to pad all tensors to the same length with PAD_INDEX
+# Similar to dataset.py, collate_playlists(). Needs to pad all tensors to the same length with PAD_INDEX
 def pad_chunk(playlists, device):
     max_len = max(len(p['context_track']) for p in playlists)
 
@@ -142,7 +137,7 @@ def playlist_metrics(ranked_indices, target_indices, target_count):
     return m
 
 # Scores every playlist against the whole catalog and averages the metrics
-def evaluate(model, item_vecs, playlists, device, chunk_size=256):
+def evaluate(model, item_vecs, playlists, device):
     max_k = max(K_VALUES)
     sums = {}
     for k in K_VALUES:
@@ -151,11 +146,11 @@ def evaluate(model, item_vecs, playlists, device, chunk_size=256):
     n = 0
 
     with torch.no_grad():
-        for start in range(0, len(playlists), chunk_size):
-            chunk = playlists[start : start + chunk_size]
+        for start in range(0, len(playlists), PLAYLIST_CHUNK):
+            chunk = playlists[start:start + PLAYLIST_CHUNK]
             track, artist, album, mask = pad_chunk(chunk, device)
 
-            # Score the playlists mean-pooled context tracks against every track in the catalog. Shape: (chunk_size, num_tracks)
+            # Score the playlists mean-pooled context tracks against every track in the catalog. Shape: (PLAYLIST_CHUNK, num_tracks)
             playlist_vec = F.normalize(model.encode_playlist(track, artist, album, mask), dim=-1)
             scores = playlist_vec @ item_vecs.t()
 
@@ -177,6 +172,7 @@ def evaluate(model, item_vecs, playlists, device, chunk_size=256):
                     for name in ('recall', 'precision', 'ndcg'):
                         sums[k][name] += m[k][name]
                 n += 1
+                
     # After all playlists are scored, average the eval metrics
     metrics = {}
     for k in K_VALUES:

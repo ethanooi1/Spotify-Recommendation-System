@@ -57,7 +57,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
     for step, batch in enumerate(loader):
         for k in batch:
             batch[k] = batch[k].to(device)
-            
+
         # calls model.forward(), shapes: playlist_vec [B, dim], item_vec [B, dim]
         playlist_vec, item_vec = model(batch)
         loss = model.in_batch_softmax_loss(playlist_vec, item_vec, item_indices=batch['pos_track'])
@@ -77,21 +77,20 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
 
     avg_total_loss = total_loss / n_batches
     avg_total_acc = total_acc / n_batches
-    
+
     return avg_total_loss, avg_total_acc
 
 # Saves model weights, epoch, and config to a .pt file
 def save_checkpoint(path, model, epoch, config):
-    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({'epoch': epoch, 'model_state_dict': model.state_dict(), 'config': config}, path)
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dim', type=int, default=128)
-    parser.add_argument('--hidden-dims', type=int, nargs='*', default=[]) 
+    parser.add_argument('--hidden-dims', type=int, nargs='*', default=[])
     parser.add_argument('--temperature', type=float, default=0.05)
-    parser.add_argument('--batch-size', type=int, default=1024) 
+    parser.add_argument('--batch-size', type=int, default=1024)
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--logq', action='store_true') # debias negatives by track popularity
@@ -111,10 +110,10 @@ def main():
     if args.logq:
         model.set_item_log_q(compute_item_counts(vocab_sizes['track']).to(device))
 
-    # Build dataset & dataloader 
+    # Build dataset & dataloader
     dataset = PlaylistDataset(CACHE_PATH, max_context_len=MAX_CONTEXT_LEN)
     loader = make_dataloader(dataset, args.batch_size, NUM_WORKERS, SEED)
-    print(f'device: {device}, dim: {args.dim}, hidden: {args.hidden_dims or "linear"}, logQ: {bool(args.logq)}, {len(dataset):,} playlists')
+    print(f'device: {device}, dim: {args.dim}, hidden: {args.hidden_dims or "linear"}, logQ: {args.logq}, {len(dataset):,} playlists')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -124,7 +123,7 @@ def main():
         'embedding_dim': args.dim,
         'temperature': args.temperature,
         'hidden_dims': args.hidden_dims,
-        'logq': bool(args.logq)
+        'logq': args.logq
     }
 
     checkpoint_path = Path(CHECKPOINT_DIR) / 'best.pt'

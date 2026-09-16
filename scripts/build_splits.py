@@ -14,7 +14,6 @@ MIN_PLAYLIST_LENGTH = 5
 MASK_FRACTION = 0.20 # hide 20% of each eval playlist
 MAX_HIDDEN = 10 # hide up to 10 songs
 
-# Spark session that does the heavy dataframe work.
 def create_spark_session():
     spark = (
         SparkSession.builder.appName('spotify-mpd-splits')
@@ -25,7 +24,7 @@ def create_spark_session():
         .config('spark.sql.session.timeZone', 'UTC')
         .getOrCreate()
     )
-    spark.sparkContext.setLogLevel('ERROR') # the aggregation buffers warn once per batch otherwise
+    spark.sparkContext.setLogLevel('ERROR')
 
     return spark
 
@@ -57,7 +56,7 @@ def build_playlist_lengths(playlists_df, playlist_tracks_df):
 def assign_playlist_splits(playlist_lengths_df):
     # Each playlist has the same split_score
     split_score = (F.pmod(
-        F.xxhash64(F.lit(str(SEED)), F.col('pid').cast('string')), 
+        F.xxhash64(F.lit(str(SEED)), F.col('pid').cast('string')),
         F.lit(1000000)) / F.lit(1000000.0))
 
     return (playlist_lengths_df
@@ -67,8 +66,7 @@ def assign_playlist_splits(playlist_lengths_df):
             .when(F.col('split_score') < F.lit(TRAIN_RATIO), F.lit('train'))
             .when(F.col('split_score') < F.lit(TRAIN_RATIO + VALIDATION_RATIO), F.lit('validation'))
             .otherwise(F.lit('test')))
-        .withColumn('eligible_for_eval', F.col('split').isin('validation', 'test'))
-        .select('pid', 'split', 'playlist_length', 'eligible_for_eval')
+        .select('pid', 'split', 'playlist_length')
     )
 
 # Build training set if split = 'train'
@@ -93,7 +91,7 @@ def build_masked_split(playlist_tracks_df, playlist_splits_df, split_name):
         .join(eval_playlists, on='pid', how='inner')
         .withColumn('mask_score',
             F.pmod(
-                F.xxhash64(F.lit(str(SEED)), F.lit(split_name), F.col('pid').cast('string'), F.col('pos').cast('string')), 
+                F.xxhash64(F.lit(str(SEED)), F.lit(split_name), F.col('pid').cast('string'), F.col('pos').cast('string')),
                 F.lit(1000000.0)))
     )
 
@@ -114,7 +112,7 @@ def build_masked_split(playlist_tracks_df, playlist_splits_df, split_name):
 def main():
     output_root = Path(OUTPUT_DIR)
     output_root.mkdir(parents=True, exist_ok=True)
-    
+
     playlist_splits_path = output_root / 'playlist_splits.parquet'
     train_playlist_tracks_path = output_root / 'train_playlist_tracks.parquet'
     validation_context_path = output_root / 'validation_context.parquet'
@@ -145,11 +143,12 @@ def main():
 
         summary = {
             'output_path': str(output_root),
-            'eligible_eval_playlists': split_counts.get('validation') + split_counts.get('test'),
+            'eligible_eval_playlists': split_counts['validation'] + split_counts['test'],
             'split_counts': split_counts
         }
+
         print(json.dumps(summary, indent=2))
-        
+
     finally:
         spark.stop()
 
