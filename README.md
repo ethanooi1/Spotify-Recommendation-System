@@ -11,18 +11,25 @@ Validation split (50,110 playlists):
 
 | model | Recall@10 | Recall@100 | NDCG@100 |
 |---|---|---|---|
-| two-tower | 0.120 | 0.358 | 0.215 |
-| co-occurrence baseline | 0.073 | 0.236 | 0.137 |
-| popularity baseline | 0.008 | 0.044 | 0.020 |
+| two-tower | 0.121 | 0.359 | 0.215 |
+| co-occurrence baseline | 0.071 | 0.232 | 0.134 |
+| popularity baseline | 0.008 | 0.045 | 0.020 |
 
-On the untouched test split (49,747 playlists) the final model gets `Recall@100 = 0.359`
-and `NDCG@100 = 0.215`, within 0.001 of validation, so the tuning didn't overfit.
+Test split (49,747 playlists):
+
+| model | Recall@10 | Recall@100 | NDCG@100 |
+|---|---|---|---|
+| two-tower | 0.120 | 0.360 | 0.215 |
+| co-occurrence baseline | 0.071 | 0.233 | 0.135 |
+| popularity baseline | 0.008 | 0.045 | 0.021 |
+
+Test is within 0.001 of validation on every metric, so the tuning didn't overfit.
 
 How it got there:
 
 - plain in-batch softmax actually **lost** to co-occurrence (Recall@100 = 0.182)
 - adding a logQ sampling-bias correction brought it to 0.328
-- adding a small MLP head on each tower brought it to 0.358
+- adding a small MLP head on each tower brought it to 0.359
 
 I also tried a deeper [256, 256] head and a bigger 8192 batch. Both were measured against the final config and neither beat it, so neither is in it.
 
