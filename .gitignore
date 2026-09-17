@@ -7,7 +7,6 @@ __pycache__/
 .venv/
 venv/
 
-# Generated data outputs, anchored so they only match the ones at the repo root
 /data/
 /artifacts/**
 !/artifacts/baselines/
@@ -17,12 +16,10 @@ venv/
 !/artifacts/twotower/
 !/artifacts/twotower/*_metrics.json
 
-# Personal learning material, not published
 NOTES.md
 notebooks/
 tests/
 personal/
 
-# My own playlist exports and their outputs stay local, the code that makes them doesn't
 recommendations/data/*.csv
 recommendations/artifacts/*.csv
