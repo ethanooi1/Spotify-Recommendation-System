@@ -81,6 +81,43 @@ python3 scripts/twotower/evaluate.py --split validation
 python3 scripts/twotower/evaluate.py --split test
 ```
 
+## Recommending for my own playlists
+
+`recommendations/` generates recommendations on any real Spotify playlist using the trained model.
+
+1. Export a playlist to CSV with [Exportify](https://exportify.net) and drop it in `recommendations/data/`
+2. Encode it and then run the recommender using:
+
+```bash
+cd recommendations
+python3 prepare_playlist.py --playlist "playlist_name"
+python3 recommend.py --playlist "playlist_name" --top-k 15
+```
+
+`prepare_playlist.py` drops anything released after 2017 since the MPD was collected before then, then matches the rest to the MPD by Spotify id or by song name and artist. `recommend.py` mean-pools the playlist into one vector, scores it against all 2.1M tracks, and skips anything already in the playlist.
+
+Top 15 for my main playlist:
+
+| rank | track | artist | score |
+|---|---|---|---|
+| 1 | Losing My Religion | R.E.M. | 0.834 |
+| 2 | Bitter Sweet Symphony | The Verve | 0.817 |
+| 3 | Creep | Radiohead | 0.795 |
+| 4 | 1979 | The Smashing Pumpkins | 0.793 |
+| 5 | Friday I'm In Love | The Cure | 0.776 |
+| 6 | Say It Ain't So | Weezer | 0.771 |
+| 7 | One | U2 | 0.771 |
+| 8 | Under The Bridge | Red Hot Chili Peppers | 0.769 |
+| 9 | Closing Time | Semisonic | 0.762 |
+| 10 | Iris | The Goo Goo Dolls | 0.760 |
+| 11 | No Rain | Blind Melon | 0.758 |
+| 12 | Semi-Charmed Life | Third Eye Blind | 0.756 |
+| 13 | Buddy Holly | Weezer | 0.751 |
+| 14 | Californication | Red Hot Chili Peppers | 0.751 |
+| 15 | Sex And Candy | Marcy Playground | 0.748 |
+
+I already knew most of these songs, and some of them were in my other playlists. But there were some recommendations that I really enjoy like Buddy Holly by Weezer.
+
 ## What I'd add next
 
 - a FAISS/ANN index over the item vectors, so retrieval doesn't need a full 2.1M track matrix multiplication

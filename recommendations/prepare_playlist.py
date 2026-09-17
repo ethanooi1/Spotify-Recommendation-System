@@ -54,8 +54,7 @@ def main():
     for e in ['track', 'artist', 'album']:
         vocabs[e] = Vocabulary.load(VOCAB_DIR / f'{e}_vocab.json')
 
-    # One song can carry several Spotify ids, so match on name and artist when the id isn't the one the MPD has,
-    # and take the copy that appears in the most training playlists
+    # One song can carry several Spotify ids, so match on name and artist when the id isn't the one the MPD has, and take the copy that appears in the most training playlists
     mpd = pd.read_parquet(TRACKS_PATH, columns=['track_id', 'track_name', 'artist_name', 'artist_id', 'album_id'])
     mpd = mpd[mpd['track_id'].isin(vocabs['track'].id_to_index)]
     mpd['key'] = [song_key(n, a) for n, a in zip(mpd['track_name'], mpd['artist_name'])]
