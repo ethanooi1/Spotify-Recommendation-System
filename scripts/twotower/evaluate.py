@@ -36,7 +36,7 @@ def load_model(checkpoint_path, device):
     model.load_state_dict(pt['model_state_dict'])
     model.eval()
 
-    return model.to(device), cfg
+    return model.to(device)
 
 # Encodes every track into an item vector for easy cosine similarity retrieval
 def build_item_index(model, cache_path, device):
@@ -207,7 +207,7 @@ def main():
     for e in ENTITIES:
         vocabs[e] = Vocabulary.load(Path(VOCAB_DIR) / f'{e}_vocab.json')
         
-    model, _ = load_model(CHECKPOINT_PATH, device)
+    model = load_model(CHECKPOINT_PATH, device)
     item_vecs = build_item_index(model, CACHE_PATH, device)
     playlists = load_eval_playlists(args.split, vocabs)
     
